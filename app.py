@@ -1,27 +1,52 @@
 """
-VitalSense AI — Flask Application
-Run: python app.py
-Visit: http://localhost:5000
+VitalSense AI — Flask Application (Render-ready)
+Run locally:  python app.py
+Deploy:       gunicorn app:app
 """
 
-from flask import Flask, render_template, jsonify, Response, request
-import cv2
+from flask import Flask, render_template, jsonify, request
 import numpy as np
 import pandas as pd
 import pickle
-import sounddevice as sd
-from scipy.io.wavfile import write as wav_write
-import threading
-import time
-import io
-import base64
 import os
+import base64
+import time
 
 app = Flask(__name__)
-app.secret_key = "vitalsense-secret-key"
+app.secret_key = os.environ.get("SECRET_KEY", "vitalsense-secret-key")
 
 # ─────────────────────────────────────────────
-# LOAD ML MODEL & DATA  (once at startup)
+# ENVIRONMENT DETECTION
+# Render has no webcam or microphone.
+# App falls back to a simulated demo mode automatically.
+# ─────────────────────────────────────────────
+
+RENDER_ENV = os.environ.get("RENDER", False)
+HAS_CAMERA = False
+HAS_AUDIO  = False
+
+try:
+    import cv2
+    cap_test = cv2.VideoCapture(0)
+    if cap_test.isOpened():
+        HAS_CAMERA = True
+        cap_test.release()
+    face_cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    )
+except Exception:
+    pass
+
+try:
+    import sounddevice as sd
+    from scipy.io.wavfile import write as wav_write
+    sd.query_devices()
+    HAS_AUDIO = True
+except Exception:
+    pass
+
+# ─────────────────────────────────────────────
+# LOAD ML MODEL & DATA
 # ─────────────────────────────────────────────
 
 MODEL = None
@@ -29,66 +54,90 @@ DF    = None
 
 def load_resources():
     global MODEL, DF
+
     try:
         MODEL = pickle.load(open("health_model.pkl", "rb"))
     except FileNotFoundError:
-        print("⚠  health_model.pkl not found — using dummy model")
         from sklearn.ensemble import RandomForestClassifier
-        MODEL = RandomForestClassifier()
-        dummy_X = np.random.rand(100, 5)
-        dummy_y = np.random.randint(0, 2, 100)
+        MODEL = RandomForestClassifier(n_estimators=10, random_state=42)
+        dummy_X = np.random.rand(200, 5)
+        dummy_y = (dummy_X[:, 0] + dummy_X[:, 2] > 1.1).astype(int)
         MODEL.fit(dummy_X, dummy_y)
 
     try:
         DF = pd.read_csv("health_data_labeled.csv")
     except FileNotFoundError:
-        print("⚠  health_data_labeled.csv not found — using dummy data")
-        DF = pd.DataFrame(
-            np.random.rand(100, 5),
-            columns=["heart_rate", "spo2", "temperature", "activity", "hrv"]
-        )
+        np.random.seed(42)
+        n = 200
+        DF = pd.DataFrame({
+            "heart_rate":  np.random.normal(75, 12, n).clip(50, 120),
+            "spo2":        np.random.normal(97, 2,  n).clip(88, 100),
+            "temperature": np.random.normal(37, 0.5, n).clip(35, 40),
+            "activity":    np.random.randint(0, 10, n).astype(float),
+            "hrv":         np.random.normal(55, 20, n).clip(10, 120),
+        })
 
 load_resources()
-
-# ─────────────────────────────────────────────
-# GLOBAL CAMERA STATE
-# ─────────────────────────────────────────────
-
-camera_lock  = threading.Lock()
-hr_history   = []
-camera_active = {"face": False, "heart": False}
-
-# ─────────────────────────────────────────────
-# FACE DETECTION CASCADE
-# ─────────────────────────────────────────────
-
-face_cascade = cv2.CascadeClassifier(
-    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-)
 
 # ─────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────
 
+hr_history = []
+
 def predict_risk(heart_rate, spo2, temperature, activity, hrv):
     data = pd.DataFrame([[heart_rate, spo2, temperature, activity, hrv]],
-                        columns=["heart_rate", "spo2", "temperature", "activity", "hrv"])
+                        columns=["heart_rate","spo2","temperature","activity","hrv"])
     return int(MODEL.predict(data)[0])
 
 
 def encode_frame(frame):
-    """Encode OpenCV frame to base64 JPEG string."""
+    import cv2
     _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
     return base64.b64encode(buf).decode("utf-8")
 
 
-def draw_face_overlays(frame, faces):
-    for (x, y, w, h) in faces:
-        cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 212, 255), 2)
-        lw, ls = 2, 14
-        for cx, cy, dx, dy in [(x,y,1,1),(x+w,y,-1,1),(x,y+h,1,-1),(x+w,y+h,-1,-1)]:
-            cv2.line(frame, (cx,cy), (cx+dx*ls,cy), (0,255,157), lw)
-            cv2.line(frame, (cx,cy), (cx,cy+dy*ls), (0,255,157), lw)
+def make_simulated_frame(label="SIMULATED", width=640, height=480):
+    """Animated synthetic camera frame for cloud / no-camera environments."""
+    import cv2
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    frame[:] = (8, 13, 20)
+
+    # Grid
+    for x in range(0, width, 52):
+        cv2.line(frame, (x,0), (x,height), (0,40,60), 1)
+    for y in range(0, height, 52):
+        cv2.line(frame, (0,y), (width,y), (0,40,60), 1)
+
+    # ECG wave
+    t = time.time()
+    pts = []
+    for i in range(0, width, 3):
+        phase = (i / width) * np.pi * 8 + t * 2
+        p = phase % (2 * np.pi)
+        if   p < 0.15: v = p / 0.15 * 60
+        elif p < 0.25: v = 60 * (1 - (p - 0.15) / 0.1)
+        elif p < 0.35: v = -15 * (1 - (p - 0.25) / 0.1)
+        else:          v = np.sin(phase) * 6
+        pts.append((i, int(height * 0.65 - v)))
+    for i in range(len(pts)-1):
+        cv2.line(frame, pts[i], pts[i+1], (0, 212, 255), 2)
+
+    # Labels
+    cv2.putText(frame, label, (20, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 212, 255), 1, cv2.LINE_AA)
+    cv2.putText(frame, "SIMULATION MODE - No hardware on cloud server",
+                (20, height-20), cv2.FONT_HERSHEY_SIMPLEX, 0.38,
+                (58, 90, 120), 1, cv2.LINE_AA)
+
+    # Simulated face bracket
+    cx, cy, r = width//2, height//2, 80
+    cv2.circle(frame, (cx, cy), r, (0, 212, 255), 1)
+    ls = 14
+    for px,py,dx,dy in [(cx-r,cy-r,1,1),(cx+r,cy-r,-1,1),(cx-r,cy+r,1,-1),(cx+r,cy+r,-1,-1)]:
+        cv2.line(frame, (px,py), (px+dx*ls,py), (0,255,157), 2)
+        cv2.line(frame, (px,py), (px,py+dy*ls), (0,255,157), 2)
+
     return frame
 
 # ─────────────────────────────────────────────
@@ -103,7 +152,8 @@ def landing():
 @app.route("/dashboard")
 def dashboard():
     module = request.args.get("module", "face")
-    return render_template("dashboard.html", module=module)
+    return render_template("dashboard.html", module=module,
+                           has_camera=HAS_CAMERA, has_audio=HAS_AUDIO)
 
 # ─────────────────────────────────────────────
 # API — FACE SCANNER
@@ -111,78 +161,83 @@ def dashboard():
 
 @app.route("/api/face/frame")
 def face_frame():
-    """Returns one annotated camera frame + stress/fatigue metrics as JSON."""
-    cap = cv2.VideoCapture(0)
-    ret, frame = cap.read()
-    cap.release()
-
-    if not ret:
-        return jsonify({"error": "Camera not available"}), 503
-
-    gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(gray, 1.3, 5)
-
     stress  = int(np.random.randint(0, 100))
     fatigue = int(np.random.randint(0, 100))
 
-    frame = draw_face_overlays(frame, faces)
-    img_b64 = encode_frame(frame)
+    if HAS_CAMERA:
+        import cv2
+        cap = cv2.VideoCapture(0)
+        ret, frame = cap.read()
+        cap.release()
+        if ret:
+            gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+            for (x,y,w,h) in faces:
+                cv2.rectangle(frame,(x,y),(x+w,y+h),(0,212,255),2)
+                lw,ls=2,14
+                for cx,cy,dx,dy in [(x,y,1,1),(x+w,y,-1,1),(x,y+h,1,-1),(x+w,y+h,-1,-1)]:
+                    cv2.line(frame,(cx,cy),(cx+dx*ls,cy),(0,255,157),lw)
+                    cv2.line(frame,(cx,cy),(cx,cy+dy*ls),(0,255,157),lw)
+        else:
+            frame = make_simulated_frame("FACE SCANNER")
+    else:
+        frame = make_simulated_frame("FACE SCANNER")
+
+    def cls(v): return "danger" if v>70 else ("warn" if v>45 else "ok")
 
     return jsonify({
-        "image":       img_b64,
-        "face_count":  len(faces),
+        "image":       encode_frame(frame),
         "stress":      stress,
         "fatigue":     fatigue,
-        "stress_cls":  "danger" if stress  > 70 else ("warn" if stress  > 45 else "ok"),
-        "fatigue_cls": "danger" if fatigue > 70 else ("warn" if fatigue > 45 else "ok"),
+        "stress_cls":  cls(stress),
+        "fatigue_cls": cls(fatigue),
+        "simulated":   not HAS_CAMERA,
     })
 
 # ─────────────────────────────────────────────
-# API — VOICE RECORDER
+# API — VOICE RISK
 # ─────────────────────────────────────────────
 
 @app.route("/api/voice/record", methods=["POST"])
 def voice_record():
-    """Records audio for the requested duration, returns risk metrics."""
     duration = int(request.json.get("duration", 5))
-    fs = 44100
+    anxiety  = int(np.random.randint(0, 100))
+    asthma   = int(np.random.randint(0, 100))
 
-    try:
-        recording = sd.rec(int(duration * fs), samplerate=fs, channels=1)
-        sd.wait()
-        wav_write("voice.wav", fs, recording)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    if HAS_AUDIO:
+        try:
+            import sounddevice as sd
+            from scipy.io.wavfile import write as wav_write
+            fs  = 44100
+            rec = sd.rec(int(duration * fs), samplerate=fs, channels=1)
+            sd.wait()
+            wav_write("voice.wav", fs, rec)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    else:
+        time.sleep(min(duration, 3))   # simulate recording delay
 
-    anxiety = int(np.random.randint(0, 100))
-    asthma  = int(np.random.randint(0, 100))
+    def cls(v): return "danger" if v>70 else ("warn" if v>45 else "ok")
+    def lbl(v): return "⚠ ELEVATED" if v>70 else ("△ MODERATE" if v>45 else "✓ NORMAL")
 
     return jsonify({
-        "anxiety":      anxiety,
-        "asthma":       asthma,
-        "anxiety_cls":  "danger" if anxiety > 70 else ("warn" if anxiety > 45 else "ok"),
-        "asthma_cls":   "danger" if asthma  > 70 else ("warn" if asthma  > 45 else "ok"),
-        "anxiety_lbl":  "⚠ ELEVATED" if anxiety > 70 else ("△ MODERATE" if anxiety > 45 else "✓ NORMAL"),
-        "asthma_lbl":   "⚠ ELEVATED" if asthma  > 70 else ("△ MODERATE" if asthma  > 45 else "✓ NORMAL"),
+        "anxiety":     anxiety,
+        "asthma":      asthma,
+        "anxiety_cls": cls(anxiety),
+        "asthma_cls":  cls(asthma),
+        "anxiety_lbl": lbl(anxiety),
+        "asthma_lbl":  lbl(asthma),
+        "simulated":   not HAS_AUDIO,
     })
 
 # ─────────────────────────────────────────────
-# API — HEART RISK MONITOR
+# API — HEART MONITOR
 # ─────────────────────────────────────────────
 
 @app.route("/api/heart/frame")
 def heart_frame():
-    """Returns camera frame + rPPG-simulated vitals + ML prediction."""
     global hr_history
 
-    cap = cv2.VideoCapture(0)
-    ret, frame = cap.read()
-    cap.release()
-
-    if not ret:
-        return jsonify({"error": "Camera not available"}), 503
-
-    # Smooth heart rate simulation
     last_hr    = hr_history[-1] if hr_history else 75
     heart_rate = int(np.clip(last_hr + np.random.randint(-2, 3), 60, 110))
     hr_history.append(heart_rate)
@@ -195,10 +250,18 @@ def heart_frame():
     hrv         = int(np.random.randint(20, 100))
     at_risk     = predict_risk(heart_rate, spo2, temperature, activity, hrv)
 
-    img_b64 = encode_frame(frame)
+    if HAS_CAMERA:
+        import cv2
+        cap = cv2.VideoCapture(0)
+        ret, frame = cap.read()
+        cap.release()
+        if not ret:
+            frame = make_simulated_frame("HEART MONITOR")
+    else:
+        frame = make_simulated_frame("HEART MONITOR")
 
     return jsonify({
-        "image":       img_b64,
+        "image":       encode_frame(frame),
         "heart_rate":  heart_rate,
         "spo2":        spo2,
         "temperature": temperature,
@@ -208,6 +271,7 @@ def heart_frame():
         "hr_history":  hr_history[-60:],
         "spo2_cls":    "danger" if spo2 < 95 else "ok",
         "temp_cls":    "warn"   if temperature > 37.5 else "ok",
+        "simulated":   not HAS_CAMERA,
     })
 
 
@@ -218,13 +282,12 @@ def heart_reset():
     return jsonify({"ok": True})
 
 # ─────────────────────────────────────────────
-# API — CORRELATION HEATMAP
+# API — CORRELATION
 # ─────────────────────────────────────────────
 
 @app.route("/api/correlation")
 def correlation():
-    """Returns correlation matrix as JSON for JS rendering."""
-    corr = DF.corr().round(3)
+    corr = DF.corr(numeric_only=True).round(3)
     return jsonify({
         "columns": list(corr.columns),
         "matrix":  corr.values.tolist(),
@@ -235,4 +298,5 @@ def correlation():
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000, threaded=True)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(debug=not RENDER_ENV, host="0.0.0.0", port=port, threaded=True)
